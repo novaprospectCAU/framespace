@@ -31,6 +31,7 @@ struct Vertex {
 
 struct Uniforms {
   float mvp[16];
+  float tint[4];
 };
 
 struct PhotoSnapshot {
@@ -43,9 +44,10 @@ struct PhotoSnapshot {
 
 struct PlacedPhoto {
   bool active;
-  uint32_t instance_id;
   uint32_t shot_id;
   Vec3 position;
+  float yaw;
+  float scale;
 };
 
 constexpr int kMaxPlacedPhotos = 64;
@@ -70,9 +72,21 @@ constexpr uint16_t kCubeIndices[] = {
     4, 5, 1, 1, 0, 4,
 };
 
+constexpr Vertex kPhotoFrameVertices[] = {
+    {-0.75f, -0.50f, 0.0f, 1.0f, 1.0f, 1.0f},
+    {0.75f, -0.50f, 0.0f, 1.0f, 1.0f, 1.0f},
+    {0.75f, 0.50f, 0.0f, 1.0f, 1.0f, 1.0f},
+    {-0.75f, 0.50f, 0.0f, 1.0f, 1.0f, 1.0f},
+};
+
+constexpr uint16_t kPhotoFrameIndices[] = {
+    0, 1, 2, 2, 3, 0,
+};
+
 constexpr char kShaderWGSL[] = R"(
 struct Uniforms {
   mvp : mat4x4<f32>,
+  tint : vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -92,7 +106,7 @@ struct VSOut {
 fn vs_main(in : VSIn) -> VSOut {
   var out : VSOut;
   out.pos = ubo.mvp * vec4<f32>(in.position, 1.0);
-  out.color = in.color;
+  out.color = in.color * ubo.tint.rgb;
   return out;
 }
 
@@ -110,8 +124,10 @@ WGPUSurface g_surface = nullptr;
 WGPUTextureFormat g_surface_format = WGPUTextureFormat_BGRA8Unorm;
 WGPUSurfaceConfiguration g_surface_config = WGPU_SURFACE_CONFIGURATION_INIT;
 
-WGPUBuffer g_vertex_buffer = nullptr;
-WGPUBuffer g_index_buffer = nullptr;
+WGPUBuffer g_cube_vertex_buffer = nullptr;
+WGPUBuffer g_cube_index_buffer = nullptr;
+WGPUBuffer g_photo_vertex_buffer = nullptr;
+WGPUBuffer g_photo_index_buffer = nullptr;
 WGPUBuffer g_uniform_buffer = nullptr;
 WGPUBindGroupLayout g_bind_group_layout = nullptr;
 WGPUBindGroup g_bind_group = nullptr;
@@ -140,7 +156,6 @@ uint32_t g_photo_capture_count = 0;
 PhotoSnapshot g_last_snapshot{};
 bool g_has_snapshot = false;
 PlacedPhoto g_placed_photos[kMaxPlacedPhotos]{};
-uint32_t g_next_placed_photo_id = 1;
 
 Mat4 g_last_vp{};
 
@@ -185,10 +200,6 @@ Vec3 vec3_normalize(Vec3 v) {
   return {v.x / len, v.y / len, v.z / len};
 }
 
-float vec3_length(Vec3 v) {
-  return std::sqrt(vec3_dot(v, v));
-}
-
 Mat4 mat4_identity() {
   Mat4 out{};
   out.m[0] = 1.0f;
@@ -209,6 +220,23 @@ Mat4 mat4_mul(Mat4 a, Mat4 b) {
           a.m[3 * 4 + r] * b.m[c * 4 + 3];
     }
   }
+  return out;
+}
+
+Mat4 mat4_translation(Vec3 t) {
+  Mat4 out = mat4_identity();
+  out.m[12] = t.x;
+  out.m[13] = t.y;
+  out.m[14] = t.z;
+  return out;
+}
+
+Mat4 mat4_scale(float x, float y, float z) {
+  Mat4 out{};
+  out.m[0] = x;
+  out.m[5] = y;
+  out.m[10] = z;
+  out.m[15] = 1.0f;
   return out;
 }
 
@@ -265,57 +293,6 @@ Vec3 camera_forward() {
       std::sin(g_camera_pitch),
       std::sin(g_camera_yaw) * cp,
   });
-}
-
-bool project_to_screen(Vec3 pos, float* out_x, float* out_y, float* out_depth) {
-  const float clip_x = g_last_vp.m[0] * pos.x + g_last_vp.m[4] * pos.y + g_last_vp.m[8] * pos.z + g_last_vp.m[12];
-  const float clip_y = g_last_vp.m[1] * pos.x + g_last_vp.m[5] * pos.y + g_last_vp.m[9] * pos.z + g_last_vp.m[13];
-  const float clip_z = g_last_vp.m[2] * pos.x + g_last_vp.m[6] * pos.y + g_last_vp.m[10] * pos.z + g_last_vp.m[14];
-  const float clip_w = g_last_vp.m[3] * pos.x + g_last_vp.m[7] * pos.y + g_last_vp.m[11] * pos.z + g_last_vp.m[15];
-
-  if (clip_w <= 0.001f) {
-    return false;
-  }
-
-  const float ndc_x = clip_x / clip_w;
-  const float ndc_y = clip_y / clip_w;
-  const float ndc_z = clip_z / clip_w;
-
-  if (ndc_x < -1.2f || ndc_x > 1.2f || ndc_y < -1.2f || ndc_y > 1.2f || ndc_z < -1.0f || ndc_z > 1.0f) {
-    return false;
-  }
-
-  *out_x = (ndc_x * 0.5f + 0.5f) * static_cast<float>(g_canvas_width);
-  *out_y = (-ndc_y * 0.5f + 0.5f) * static_cast<float>(g_canvas_height);
-  *out_depth = clip_w;
-  return true;
-}
-
-void update_placed_photo_overlay() {
-  for (int i = 0; i < kMaxPlacedPhotos; ++i) {
-    if (!g_placed_photos[i].active) {
-      continue;
-    }
-
-    float sx = 0.0f;
-    float sy = 0.0f;
-    float depth = 1.0f;
-    const bool visible = project_to_screen(g_placed_photos[i].position, &sx, &sy, &depth);
-
-    float size_px = 120.0f;
-    if (visible) {
-      const float dist = vec3_length(vec3_sub(g_placed_photos[i].position, g_camera_pos));
-      size_px = 240.0f / (1.0f + dist * 0.45f);
-      if (size_px < 48.0f) size_px = 48.0f;
-      if (size_px > 180.0f) size_px = 180.0f;
-    }
-
-    EM_ASM({
-      if (window.__framespaceUpdatePlacedPhoto) {
-        window.__framespaceUpdatePlacedPhoto($0, $1, $2, $3, $4);
-      }
-    }, static_cast<int>(g_placed_photos[i].instance_id), visible ? 1 : 0, sx, sy, size_px);
-  }
 }
 
 void create_depth_buffer() {
@@ -386,15 +363,29 @@ void create_pipeline_resources() {
   vb_desc.label = make_str_view("cube_vertex_buffer");
   vb_desc.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
   vb_desc.size = sizeof(kCubeVertices);
-  g_vertex_buffer = wgpuDeviceCreateBuffer(g_device, &vb_desc);
-  wgpuQueueWriteBuffer(g_queue, g_vertex_buffer, 0, kCubeVertices, sizeof(kCubeVertices));
+  g_cube_vertex_buffer = wgpuDeviceCreateBuffer(g_device, &vb_desc);
+  wgpuQueueWriteBuffer(g_queue, g_cube_vertex_buffer, 0, kCubeVertices, sizeof(kCubeVertices));
 
   WGPUBufferDescriptor ib_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
   ib_desc.label = make_str_view("cube_index_buffer");
   ib_desc.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
   ib_desc.size = sizeof(kCubeIndices);
-  g_index_buffer = wgpuDeviceCreateBuffer(g_device, &ib_desc);
-  wgpuQueueWriteBuffer(g_queue, g_index_buffer, 0, kCubeIndices, sizeof(kCubeIndices));
+  g_cube_index_buffer = wgpuDeviceCreateBuffer(g_device, &ib_desc);
+  wgpuQueueWriteBuffer(g_queue, g_cube_index_buffer, 0, kCubeIndices, sizeof(kCubeIndices));
+
+  WGPUBufferDescriptor pvb_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+  pvb_desc.label = make_str_view("photo_vertex_buffer");
+  pvb_desc.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
+  pvb_desc.size = sizeof(kPhotoFrameVertices);
+  g_photo_vertex_buffer = wgpuDeviceCreateBuffer(g_device, &pvb_desc);
+  wgpuQueueWriteBuffer(g_queue, g_photo_vertex_buffer, 0, kPhotoFrameVertices, sizeof(kPhotoFrameVertices));
+
+  WGPUBufferDescriptor pib_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+  pib_desc.label = make_str_view("photo_index_buffer");
+  pib_desc.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
+  pib_desc.size = sizeof(kPhotoFrameIndices);
+  g_photo_index_buffer = wgpuDeviceCreateBuffer(g_device, &pib_desc);
+  wgpuQueueWriteBuffer(g_queue, g_photo_index_buffer, 0, kPhotoFrameIndices, sizeof(kPhotoFrameIndices));
 
   WGPUBufferDescriptor ub_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
   ub_desc.label = make_str_view("camera_uniform_buffer");
@@ -479,15 +470,12 @@ void create_pipeline_resources() {
   pipe_desc.vertex.entryPoint = make_str_view("vs_main");
   pipe_desc.vertex.bufferCount = 1;
   pipe_desc.vertex.buffers = &vbuf_layout;
-
   pipe_desc.primitive = WGPU_PRIMITIVE_STATE_INIT;
   pipe_desc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
   pipe_desc.primitive.frontFace = WGPUFrontFace_CCW;
-  pipe_desc.primitive.cullMode = WGPUCullMode_Back;
-
+  pipe_desc.primitive.cullMode = WGPUCullMode_None;
   pipe_desc.multisample = WGPU_MULTISAMPLE_STATE_INIT;
   pipe_desc.multisample.count = 1;
-
   pipe_desc.depthStencil = &depth_state;
   pipe_desc.fragment = &frag_state;
 
@@ -502,18 +490,10 @@ void update_camera(float dt_sec) {
   const Vec3 right = vec3_normalize(vec3_cross(forward, Vec3{0.0f, 1.0f, 0.0f}));
 
   Vec3 move{0.0f, 0.0f, 0.0f};
-  if (g_key_w) {
-    move = vec3_add(move, forward);
-  }
-  if (g_key_s) {
-    move = vec3_sub(move, forward);
-  }
-  if (g_key_d) {
-    move = vec3_add(move, right);
-  }
-  if (g_key_a) {
-    move = vec3_sub(move, right);
-  }
+  if (g_key_w) move = vec3_add(move, forward);
+  if (g_key_s) move = vec3_sub(move, forward);
+  if (g_key_d) move = vec3_add(move, right);
+  if (g_key_a) move = vec3_sub(move, right);
 
   if (vec3_dot(move, move) > 0.0f) {
     move = vec3_normalize(move);
@@ -523,20 +503,48 @@ void update_camera(float dt_sec) {
   g_camera_pos = vec3_add(g_camera_pos, vec3_scale(move, speed * dt_sec));
 }
 
-void update_uniforms() {
+void update_view_projection() {
   const float aspect = static_cast<float>(g_canvas_width) / static_cast<float>(g_canvas_height);
   const Mat4 proj = mat4_perspective_rh_zo(60.0f * 3.14159265f / 180.0f, aspect, 0.1f, 200.0f);
   const Vec3 fwd = camera_forward();
   const Mat4 view = mat4_look_at_rh(g_camera_pos, vec3_add(g_camera_pos, fwd), Vec3{0.0f, 1.0f, 0.0f});
-  const Mat4 model = mat4_rotation_y(g_accum_time * 0.7f);
+  g_last_vp = mat4_mul(proj, view);
+}
 
-  const Mat4 vp = mat4_mul(proj, view);
-  g_last_vp = vp;
-  const Mat4 mvp = mat4_mul(vp, model);
+void write_uniform(Mat4 model, float tr, float tg, float tb) {
+  const Mat4 mvp = mat4_mul(g_last_vp, model);
+  Uniforms u{};
+  std::memcpy(u.mvp, mvp.m, sizeof(mvp.m));
+  u.tint[0] = tr;
+  u.tint[1] = tg;
+  u.tint[2] = tb;
+  u.tint[3] = 1.0f;
+  wgpuQueueWriteBuffer(g_queue, g_uniform_buffer, 0, &u, sizeof(u));
+}
 
-  Uniforms uniforms{};
-  std::memcpy(uniforms.mvp, mvp.m, sizeof(mvp.m));
-  wgpuQueueWriteBuffer(g_queue, g_uniform_buffer, 0, &uniforms, sizeof(Uniforms));
+void draw_mesh(WGPURenderPassEncoder pass,
+               WGPUBuffer vertex_buffer,
+               size_t vertex_size,
+               WGPUBuffer index_buffer,
+               size_t index_size,
+               uint32_t index_count,
+               Mat4 model,
+               float tr,
+               float tg,
+               float tb) {
+  write_uniform(model, tr, tg, tb);
+  wgpuRenderPassEncoderSetVertexBuffer(pass, 0, vertex_buffer, 0, vertex_size);
+  wgpuRenderPassEncoderSetIndexBuffer(pass, index_buffer, WGPUIndexFormat_Uint16, 0, index_size);
+  wgpuRenderPassEncoderDrawIndexed(pass, index_count, 1, 0, 0, 0);
+}
+
+Vec3 shot_tint(uint32_t shot_id) {
+  const float t = static_cast<float>(shot_id) * 0.37f;
+  return {
+      0.55f + 0.45f * std::sin(t + 0.0f),
+      0.55f + 0.45f * std::sin(t + 2.1f),
+      0.55f + 0.45f * std::sin(t + 4.2f),
+  };
 }
 
 void capture_photo_snapshot() {
@@ -558,16 +566,10 @@ void capture_photo_snapshot() {
 
   EM_ASM({
     const shotId = $0;
-    if (!window.__framespaceAddSnapshot) {
-      return;
-    }
+    if (!window.__framespaceAddSnapshot) return;
     const canvas = document.querySelector("#canvas");
-    if (!canvas) {
-      console.warn("Capture failed: canvas missing");
-      return;
-    }
-    const dataUrl = canvas.toDataURL("image/png");
-    window.__framespaceAddSnapshot(shotId, dataUrl);
+    if (!canvas) return;
+    window.__framespaceAddSnapshot(shotId, canvas.toDataURL("image/png"));
   }, static_cast<int>(g_last_snapshot.id));
 }
 
@@ -575,8 +577,8 @@ void place_selected_snapshot() {
   const int selected_shot = EM_ASM_INT({
     return window.__framespaceGetSelectedShotId ? window.__framespaceGetSelectedShotId() : 0;
   });
-
   if (selected_shot <= 0) {
+    std::fprintf(stdout, "[Place] skipped: no selected snapshot\n");
     return;
   }
 
@@ -588,22 +590,35 @@ void place_selected_snapshot() {
     }
   }
   if (free_slot < 0) {
+    std::fprintf(stdout, "[Place] skipped: photo slots are full\n");
     return;
   }
 
   const Vec3 forward = camera_forward();
-  const Vec3 place_pos = vec3_add(g_camera_pos, vec3_scale(forward, 2.4f));
+  const Vec3 pos = vec3_add(g_camera_pos, vec3_scale(forward, 2.8f));
 
   g_placed_photos[free_slot].active = true;
   g_placed_photos[free_slot].shot_id = static_cast<uint32_t>(selected_shot);
-  g_placed_photos[free_slot].instance_id = g_next_placed_photo_id++;
-  g_placed_photos[free_slot].position = place_pos;
+  g_placed_photos[free_slot].position = pos;
+  g_placed_photos[free_slot].yaw = g_camera_yaw + 3.14159265f;
+  g_placed_photos[free_slot].scale = 1.0f;
 
-  EM_ASM({
-    if (window.__framespaceAddPlacedPhoto) {
-      window.__framespaceAddPlacedPhoto($0, $1);
-    }
-  }, static_cast<int>(g_placed_photos[free_slot].instance_id), selected_shot);
+  std::fprintf(stdout, "[Place] shot=%u slot=%d pos=(%.2f, %.2f, %.2f)\n",
+               g_placed_photos[free_slot].shot_id,
+               free_slot,
+               g_placed_photos[free_slot].position.x,
+               g_placed_photos[free_slot].position.y,
+               g_placed_photos[free_slot].position.z);
+}
+
+extern "C" {
+EMSCRIPTEN_KEEPALIVE void framespace_trigger_capture() {
+  capture_photo_snapshot();
+}
+
+EMSCRIPTEN_KEEPALIVE void framespace_trigger_place() {
+  place_selected_snapshot();
+}
 }
 
 EM_BOOL on_key_down(int, const EmscriptenKeyboardEvent* e, void*) {
@@ -667,7 +682,7 @@ void frame() {
 
   recreate_surface_if_needed();
   update_camera(dt_sec);
-  update_uniforms();
+  update_view_projection();
 
   WGPUSurfaceTexture surface_texture = WGPU_SURFACE_TEXTURE_INIT;
   wgpuSurfaceGetCurrentTexture(g_surface, &surface_texture);
@@ -703,9 +718,42 @@ void frame() {
   WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
   wgpuRenderPassEncoderSetPipeline(pass, g_pipeline);
   wgpuRenderPassEncoderSetBindGroup(pass, 0, g_bind_group, 0, nullptr);
-  wgpuRenderPassEncoderSetVertexBuffer(pass, 0, g_vertex_buffer, 0, sizeof(kCubeVertices));
-  wgpuRenderPassEncoderSetIndexBuffer(pass, g_index_buffer, WGPUIndexFormat_Uint16, 0, sizeof(kCubeIndices));
-  wgpuRenderPassEncoderDrawIndexed(pass, static_cast<uint32_t>(sizeof(kCubeIndices) / sizeof(kCubeIndices[0])), 1, 0, 0, 0);
+
+  const Mat4 cube_model = mat4_rotation_y(g_accum_time * 0.7f);
+  draw_mesh(pass,
+            g_cube_vertex_buffer,
+            sizeof(kCubeVertices),
+            g_cube_index_buffer,
+            sizeof(kCubeIndices),
+            static_cast<uint32_t>(sizeof(kCubeIndices) / sizeof(kCubeIndices[0])),
+            cube_model,
+            1.0f,
+            1.0f,
+            1.0f);
+
+  for (int i = 0; i < kMaxPlacedPhotos; ++i) {
+    if (!g_placed_photos[i].active) {
+      continue;
+    }
+
+    const Mat4 t = mat4_translation(g_placed_photos[i].position);
+    const Mat4 r = mat4_rotation_y(g_placed_photos[i].yaw);
+    const Mat4 s = mat4_scale(g_placed_photos[i].scale, g_placed_photos[i].scale, 1.0f);
+    const Mat4 model = mat4_mul(t, mat4_mul(r, s));
+    const Vec3 tint = shot_tint(g_placed_photos[i].shot_id);
+
+    draw_mesh(pass,
+              g_photo_vertex_buffer,
+              sizeof(kPhotoFrameVertices),
+              g_photo_index_buffer,
+              sizeof(kPhotoFrameIndices),
+              static_cast<uint32_t>(sizeof(kPhotoFrameIndices) / sizeof(kPhotoFrameIndices[0])),
+              model,
+              tint.x,
+              tint.y,
+              tint.z);
+  }
+
   wgpuRenderPassEncoderEnd(pass);
   wgpuRenderPassEncoderRelease(pass);
 
@@ -718,8 +766,6 @@ void frame() {
   wgpuCommandEncoderRelease(encoder);
   wgpuTextureViewRelease(color_view);
   wgpuTextureRelease(surface_texture.texture);
-
-  update_placed_photo_overlay();
 }
 
 void request_device_callback(WGPURequestDeviceStatus status,

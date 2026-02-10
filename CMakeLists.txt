@@ -26,6 +26,7 @@ target_link_options(framespace PRIVATE
   --use-port=emdawnwebgpu
   -sASYNCIFY
   -sALLOW_MEMORY_GROWTH=1
-  -sEXPORTED_RUNTIME_METHODS=['ccall','cwrap']
+   -sEXPORTED_RUNTIME_METHODS=['ccall','cwrap']
+  -sEXPORTED_FUNCTIONS=['_main','_framespace_trigger_capture','_framespace_trigger_place']
   --shell-file ${CMAKE_SOURCE_DIR}/web/shell.html
 )
