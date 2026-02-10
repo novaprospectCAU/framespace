@@ -26,24 +26,22 @@ cd /Users/waynelee/framespace
 
 브라우저에서 `http://localhost:8080/framespace.html` 접속.
 
-## 수동 빌드
+## 조작법 (현재 프로토타입)
 
-```bash
-cd /Users/waynelee/framespace
-source <emsdk_path>/emsdk_env.sh
-emcmake cmake -S . -B build -G Ninja
-cmake --build build
-```
+- 캔버스 클릭: 마우스 포인터 락
+- 마우스 이동: 시점 회전
+- `W A S D`: 이동
+- `Shift`: 빠르게 이동
 
 ## 현재 상태
 
 - WebGPU 디바이스/서피스 초기화
 - 프레임 루프 실행
-- 배경 클리어 렌더링
+- 깊이 버퍼 포함 3D 큐브 렌더링
+- FPS 독립 카메라 이동/시점 제어
 
 ## 다음 단계
 
-- 카메라/투영 행렬 시스템
-- 장면 오브젝트 관리
 - 스냅샷(색+깊이) 캡처
-- 프레임 배치/경계 통과 물리 연동
+- 사진 프레임 배치 및 로컬 공간화
+- 경계 통과 물리 전환
