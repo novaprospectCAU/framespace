@@ -33,6 +33,23 @@ struct Uniforms {
   float mvp[16];
 };
 
+struct PhotoSnapshot {
+  uint32_t id;
+  Vec3 position;
+  float yaw;
+  float pitch;
+  double timestamp_ms;
+};
+
+struct PlacedPhoto {
+  bool active;
+  uint32_t instance_id;
+  uint32_t shot_id;
+  Vec3 position;
+};
+
+constexpr int kMaxPlacedPhotos = 64;
+
 constexpr Vertex kCubeVertices[] = {
     {-1.0f, -1.0f, -1.0f, 0.96f, 0.36f, 0.31f},
     {1.0f, -1.0f, -1.0f, 0.98f, 0.69f, 0.26f},
@@ -119,6 +136,14 @@ bool g_key_s = false;
 bool g_key_d = false;
 bool g_key_shift = false;
 
+uint32_t g_photo_capture_count = 0;
+PhotoSnapshot g_last_snapshot{};
+bool g_has_snapshot = false;
+PlacedPhoto g_placed_photos[kMaxPlacedPhotos]{};
+uint32_t g_next_placed_photo_id = 1;
+
+Mat4 g_last_vp{};
+
 bool g_initialized = false;
 
 WGPUStringView make_str_view(const char* s) {
@@ -126,10 +151,6 @@ WGPUStringView make_str_view(const char* s) {
   v.data = s;
   v.length = WGPU_STRLEN;
   return v;
-}
-
-const char* msg_or_empty(WGPUStringView v) {
-  return (v.data != nullptr) ? v.data : "";
 }
 
 Vec3 vec3_add(Vec3 a, Vec3 b) {
@@ -162,6 +183,10 @@ Vec3 vec3_normalize(Vec3 v) {
     return {0.0f, 0.0f, 0.0f};
   }
   return {v.x / len, v.y / len, v.z / len};
+}
+
+float vec3_length(Vec3 v) {
+  return std::sqrt(vec3_dot(v, v));
 }
 
 Mat4 mat4_identity() {
@@ -240,6 +265,57 @@ Vec3 camera_forward() {
       std::sin(g_camera_pitch),
       std::sin(g_camera_yaw) * cp,
   });
+}
+
+bool project_to_screen(Vec3 pos, float* out_x, float* out_y, float* out_depth) {
+  const float clip_x = g_last_vp.m[0] * pos.x + g_last_vp.m[4] * pos.y + g_last_vp.m[8] * pos.z + g_last_vp.m[12];
+  const float clip_y = g_last_vp.m[1] * pos.x + g_last_vp.m[5] * pos.y + g_last_vp.m[9] * pos.z + g_last_vp.m[13];
+  const float clip_z = g_last_vp.m[2] * pos.x + g_last_vp.m[6] * pos.y + g_last_vp.m[10] * pos.z + g_last_vp.m[14];
+  const float clip_w = g_last_vp.m[3] * pos.x + g_last_vp.m[7] * pos.y + g_last_vp.m[11] * pos.z + g_last_vp.m[15];
+
+  if (clip_w <= 0.001f) {
+    return false;
+  }
+
+  const float ndc_x = clip_x / clip_w;
+  const float ndc_y = clip_y / clip_w;
+  const float ndc_z = clip_z / clip_w;
+
+  if (ndc_x < -1.2f || ndc_x > 1.2f || ndc_y < -1.2f || ndc_y > 1.2f || ndc_z < -1.0f || ndc_z > 1.0f) {
+    return false;
+  }
+
+  *out_x = (ndc_x * 0.5f + 0.5f) * static_cast<float>(g_canvas_width);
+  *out_y = (-ndc_y * 0.5f + 0.5f) * static_cast<float>(g_canvas_height);
+  *out_depth = clip_w;
+  return true;
+}
+
+void update_placed_photo_overlay() {
+  for (int i = 0; i < kMaxPlacedPhotos; ++i) {
+    if (!g_placed_photos[i].active) {
+      continue;
+    }
+
+    float sx = 0.0f;
+    float sy = 0.0f;
+    float depth = 1.0f;
+    const bool visible = project_to_screen(g_placed_photos[i].position, &sx, &sy, &depth);
+
+    float size_px = 120.0f;
+    if (visible) {
+      const float dist = vec3_length(vec3_sub(g_placed_photos[i].position, g_camera_pos));
+      size_px = 240.0f / (1.0f + dist * 0.45f);
+      if (size_px < 48.0f) size_px = 48.0f;
+      if (size_px > 180.0f) size_px = 180.0f;
+    }
+
+    EM_ASM({
+      if (window.__framespaceUpdatePlacedPhoto) {
+        window.__framespaceUpdatePlacedPhoto($0, $1, $2, $3, $4);
+      }
+    }, static_cast<int>(g_placed_photos[i].instance_id), visible ? 1 : 0, sx, sy, size_px);
+  }
 }
 
 void create_depth_buffer() {
@@ -455,11 +531,79 @@ void update_uniforms() {
   const Mat4 model = mat4_rotation_y(g_accum_time * 0.7f);
 
   const Mat4 vp = mat4_mul(proj, view);
+  g_last_vp = vp;
   const Mat4 mvp = mat4_mul(vp, model);
 
   Uniforms uniforms{};
   std::memcpy(uniforms.mvp, mvp.m, sizeof(mvp.m));
   wgpuQueueWriteBuffer(g_queue, g_uniform_buffer, 0, &uniforms, sizeof(Uniforms));
+}
+
+void capture_photo_snapshot() {
+  g_photo_capture_count += 1;
+  g_last_snapshot.id = g_photo_capture_count;
+  g_last_snapshot.position = g_camera_pos;
+  g_last_snapshot.yaw = g_camera_yaw;
+  g_last_snapshot.pitch = g_camera_pitch;
+  g_last_snapshot.timestamp_ms = emscripten_get_now();
+  g_has_snapshot = true;
+
+  std::fprintf(stdout, "[Capture] shot=%u pos=(%.2f, %.2f, %.2f) yaw=%.2f pitch=%.2f\n",
+               g_last_snapshot.id,
+               g_last_snapshot.position.x,
+               g_last_snapshot.position.y,
+               g_last_snapshot.position.z,
+               g_last_snapshot.yaw,
+               g_last_snapshot.pitch);
+
+  EM_ASM({
+    const shotId = $0;
+    if (!window.__framespaceAddSnapshot) {
+      return;
+    }
+    const canvas = document.querySelector("#canvas");
+    if (!canvas) {
+      console.warn("Capture failed: canvas missing");
+      return;
+    }
+    const dataUrl = canvas.toDataURL("image/png");
+    window.__framespaceAddSnapshot(shotId, dataUrl);
+  }, static_cast<int>(g_last_snapshot.id));
+}
+
+void place_selected_snapshot() {
+  const int selected_shot = EM_ASM_INT({
+    return window.__framespaceGetSelectedShotId ? window.__framespaceGetSelectedShotId() : 0;
+  });
+
+  if (selected_shot <= 0) {
+    return;
+  }
+
+  int free_slot = -1;
+  for (int i = 0; i < kMaxPlacedPhotos; ++i) {
+    if (!g_placed_photos[i].active) {
+      free_slot = i;
+      break;
+    }
+  }
+  if (free_slot < 0) {
+    return;
+  }
+
+  const Vec3 forward = camera_forward();
+  const Vec3 place_pos = vec3_add(g_camera_pos, vec3_scale(forward, 2.4f));
+
+  g_placed_photos[free_slot].active = true;
+  g_placed_photos[free_slot].shot_id = static_cast<uint32_t>(selected_shot);
+  g_placed_photos[free_slot].instance_id = g_next_placed_photo_id++;
+  g_placed_photos[free_slot].position = place_pos;
+
+  EM_ASM({
+    if (window.__framespaceAddPlacedPhoto) {
+      window.__framespaceAddPlacedPhoto($0, $1);
+    }
+  }, static_cast<int>(g_placed_photos[free_slot].instance_id), selected_shot);
 }
 
 EM_BOOL on_key_down(int, const EmscriptenKeyboardEvent* e, void*) {
@@ -468,6 +612,8 @@ EM_BOOL on_key_down(int, const EmscriptenKeyboardEvent* e, void*) {
   if (std::strcmp(e->code, "KeyS") == 0) g_key_s = true;
   if (std::strcmp(e->code, "KeyD") == 0) g_key_d = true;
   if (std::strcmp(e->code, "ShiftLeft") == 0 || std::strcmp(e->code, "ShiftRight") == 0) g_key_shift = true;
+  if (std::strcmp(e->code, "KeyP") == 0 && !e->repeat) capture_photo_snapshot();
+  if (std::strcmp(e->code, "KeyE") == 0 && !e->repeat) place_selected_snapshot();
   return EM_TRUE;
 }
 
@@ -572,6 +718,8 @@ void frame() {
   wgpuCommandEncoderRelease(encoder);
   wgpuTextureViewRelease(color_view);
   wgpuTextureRelease(surface_texture.texture);
+
+  update_placed_photo_overlay();
 }
 
 void request_device_callback(WGPURequestDeviceStatus status,
@@ -580,7 +728,7 @@ void request_device_callback(WGPURequestDeviceStatus status,
                              void*,
                              void*) {
   if (status != WGPURequestDeviceStatus_Success || device == nullptr) {
-    std::fprintf(stderr, "Failed to request WebGPU device: %s\n", msg_or_empty(message));
+    std::fprintf(stderr, "Failed to request WebGPU device: %s\n", message.data ? message.data : "");
     return;
   }
 
@@ -612,7 +760,7 @@ void request_adapter_callback(WGPURequestAdapterStatus status,
                               void*,
                               void*) {
   if (status != WGPURequestAdapterStatus_Success || adapter == nullptr) {
-    std::fprintf(stderr, "Failed to request WebGPU adapter: %s\n", msg_or_empty(message));
+    std::fprintf(stderr, "Failed to request WebGPU adapter: %s\n", message.data ? message.data : "");
     return;
   }
 

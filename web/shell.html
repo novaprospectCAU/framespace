@@ -5,37 +5,107 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>framespace - WebGPU</title>
     <style>
-      html,
-      body {
-        margin: 0;
-        width: 100%;
-        height: 100%;
-        background: #0b0f17;
-        color: #dce3f1;
-        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      }
-
-      body {
-        display: grid;
-        grid-template-rows: auto 1fr;
-      }
-
-      .topbar {
-        padding: 10px 14px;
-        border-bottom: 1px solid #1f2a3f;
-        font-size: 13px;
-      }
-
-      #canvas {
-        width: 100%;
-        height: 100%;
-        display: block;
+      html, body { margin: 0; width: 100%; height: 100%; background: #0b0f17; color: #dce3f1; font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      body { display: grid; grid-template-rows: auto 1fr; }
+      .topbar { padding: 10px 14px; border-bottom: 1px solid #1f2a3f; font-size: 13px; }
+      .app { display: grid; grid-template-columns: 1fr 280px; min-height: 0; min-width: 0; height: 100%; }
+      .viewport { position: relative; min-width: 0; min-height: 0; background: radial-gradient(circle at 30% 20%, #19263f, #0b0f17 60%); }
+      #canvas { width: 100%; height: 100%; display: block; }
+      #world-overlay { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+      .placed-photo { position: absolute; border: 2px solid rgba(240,247,255,.9); border-radius: 6px; box-shadow: 0 10px 24px rgba(0,0,0,.45); transform: translate(-50%, -50%); }
+      .sidebar { border-left: 1px solid #1f2a3f; background: linear-gradient(180deg,#0f1829,#0b111c 45%,#0a1018); padding: 12px; display: grid; grid-template-rows: auto auto 1fr auto; gap: 10px; }
+      .sidebar h3 { margin: 0; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: #9cb3d6; }
+      .hint { margin: 0; font-size: 12px; color: #b8c6df; line-height: 1.5; }
+      #snapshot-list { display: grid; grid-template-columns: 1fr; gap: 8px; overflow: auto; min-height: 0; }
+      .snapshot-item { border: 1px solid #2a3a59; background: #111d33; border-radius: 8px; padding: 6px; text-align: left; color: #dbe6fa; cursor: pointer; }
+      .snapshot-item.selected { border-color: #79b2ff; box-shadow: 0 0 0 1px rgba(121,178,255,.35) inset; background: #162744; }
+      .snapshot-item img { width: 100%; border-radius: 4px; display: block; margin-bottom: 6px; }
+      .snapshot-item .meta { font-size: 11px; color: #9fb4d8; }
+      @media (max-width: 960px) {
+        .app { grid-template-columns: 1fr; grid-template-rows: 1fr 220px; }
+        .sidebar { border-left: none; border-top: 1px solid #1f2a3f; }
+        #snapshot-list { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       }
     </style>
   </head>
   <body>
-    <div class="topbar">framespace | WebGPU + WASM (C++) bootstrap</div>
-    <canvas id="canvas"></canvas>
+    <div class="topbar">framespace | Capture with <b>P</b>, place selected shot with <b>E</b></div>
+    <div class="app">
+      <div class="viewport"><canvas id="canvas"></canvas><div id="world-overlay"></div></div>
+      <aside class="sidebar">
+        <h3>Snapshot Inventory</h3>
+        <p class="hint">캔버스를 클릭한 뒤 <b>P</b>로 사진을 찍고, 우측 썸네일을 선택한 다음 <b>E</b>로 월드에 배치하세요.</p>
+        <div id="snapshot-list"></div>
+        <p class="hint">WASD 이동 / Shift 가속 / 마우스 시점</p>
+      </aside>
+    </div>
+    <script>
+      (() => {
+        const shots = new Map();
+        let selectedShotId = 0;
+        const list = document.getElementById('snapshot-list');
+        const overlay = document.getElementById('world-overlay');
+
+        function renderInventory() {
+          list.innerHTML = '';
+          const ids = [...shots.keys()].sort((a, b) => b - a);
+          for (const id of ids) {
+            const shot = shots.get(id);
+            const btn = document.createElement('button');
+            btn.className = 'snapshot-item' + (id === selectedShotId ? ' selected' : '');
+            btn.type = 'button';
+
+            const img = document.createElement('img');
+            img.src = shot.dataUrl;
+            img.alt = `shot-${id}`;
+            btn.appendChild(img);
+
+            const meta = document.createElement('div');
+            meta.className = 'meta';
+            meta.textContent = `shot #${id}`;
+            btn.appendChild(meta);
+
+            btn.addEventListener('click', () => {
+              selectedShotId = id;
+              renderInventory();
+            });
+
+            list.appendChild(btn);
+          }
+        }
+
+        window.__framespaceAddSnapshot = (shotId, dataUrl) => {
+          shots.set(shotId, { dataUrl });
+          if (!selectedShotId) selectedShotId = shotId;
+          renderInventory();
+        };
+
+        window.__framespaceGetSelectedShotId = () => selectedShotId || 0;
+
+        window.__framespaceAddPlacedPhoto = (instanceId, shotId) => {
+          const shot = shots.get(shotId);
+          if (!shot) return;
+          let img = document.getElementById(`placed-${instanceId}`);
+          if (!img) {
+            img = document.createElement('img');
+            img.id = `placed-${instanceId}`;
+            img.className = 'placed-photo';
+            overlay.appendChild(img);
+          }
+          img.src = shot.dataUrl;
+        };
+
+        window.__framespaceUpdatePlacedPhoto = (instanceId, visible, x, y, size) => {
+          const img = document.getElementById(`placed-${instanceId}`);
+          if (!img) return;
+          if (!visible) { img.style.display = 'none'; return; }
+          img.style.display = 'block';
+          img.style.left = `${x}px`;
+          img.style.top = `${y}px`;
+          img.style.width = `${size}px`;
+        };
+      })();
+    </script>
     {{{ SCRIPT }}}
   </body>
 </html>
