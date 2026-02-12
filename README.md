@@ -35,6 +35,8 @@ cd /Users/waynelee/framespace
 - `P`: 현재 시점을 사진으로 캡처하고 우측 인벤토리에 저장
 - 인벤토리 썸네일 클릭: 배치할 사진 선택
 - `E`: 선택된 사진을 월드 전방에 3D 프레임으로 배치
+- 상단 `Capture` / `Place` 버튼: 키 입력과 동일한 동작
+- 상단 `Remove Selected` / `Clear All`: 인벤토리 정리
 
 ## 현재 상태
 
@@ -44,6 +46,7 @@ cd /Users/waynelee/framespace
 - FPS 독립 카메라 이동/시점 제어
 - 우측 스냅샷 인벤토리 UI
 - 선택 사진의 월드 3D 프레임 배치
+- 비동기 스냅샷 캡처(`canvas.toBlob`) 및 인벤토리 최대 48장 제한
 
 ## 다음 단계
 

@@ -23,6 +23,32 @@
         padding: 10px 14px;
         border-bottom: 1px solid #1f2a3f;
         font-size: 13px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      .toolbar {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .tool-btn {
+        border: 1px solid #2f4a78;
+        background: #132440;
+        color: #dbe6fa;
+        border-radius: 8px;
+        padding: 6px 10px;
+        font-size: 12px;
+        cursor: pointer;
+      }
+
+      .tool-btn.warn {
+        border-color: #6c3652;
+        background: #2a1624;
       }
 
       .app {
@@ -68,6 +94,12 @@
         font-size: 12px;
         color: #b8c6df;
         line-height: 1.5;
+      }
+
+      .status {
+        margin: 0;
+        font-size: 11px;
+        color: #9cb3d6;
       }
 
       #snapshot-list {
@@ -124,12 +156,21 @@
     </style>
   </head>
   <body>
-    <div class="topbar">framespace | Capture with <b>P</b>, place selected shot with <b>E</b></div>
+    <div class="topbar">
+      <div>framespace | Capture with <b>P</b>, place selected shot with <b>E</b></div>
+      <div class="toolbar">
+        <button id="btn-capture" class="tool-btn" type="button">Capture</button>
+        <button id="btn-place" class="tool-btn" type="button">Place</button>
+        <button id="btn-remove" class="tool-btn" type="button">Remove Selected</button>
+        <button id="btn-clear" class="tool-btn warn" type="button">Clear All</button>
+      </div>
+    </div>
     <div class="app">
       <div class="viewport"><canvas id="canvas"></canvas></div>
       <aside class="sidebar">
         <h3>Snapshot Inventory</h3>
         <p class="hint">캔버스를 클릭한 뒤 <b>P</b>로 사진을 찍고, 우측 썸네일을 선택한 다음 <b>E</b>로 월드에 배치하세요.</p>
+        <p id="snapshot-status" class="status">shots: 0 / 48</p>
         <div id="snapshot-list"></div>
         <p class="hint">WASD 이동 / Shift 가속 / 마우스 시점</p>
       </aside>
@@ -137,13 +178,57 @@
 
     <script>
       (() => {
+        const MAX_SHOTS = 48;
         const shots = new Map();
         let selectedShotId = 0;
         const list = document.getElementById('snapshot-list');
+        const statusEl = document.getElementById('snapshot-status');
+
+        function updateStatus() {
+          statusEl.textContent = `shots: ${shots.size} / ${MAX_SHOTS}`;
+        }
+
+        function invokeNative(fnName) {
+          if (!window.Module || typeof window.Module.ccall !== 'function') {
+            console.warn(`[UI] ${fnName} ignored: runtime not ready`);
+            return;
+          }
+          window.Module.ccall(fnName, null, [], []);
+        }
+
+        function disposeShot(shot) {
+          if (shot && shot.objectUrl) {
+            URL.revokeObjectURL(shot.objectUrl);
+          }
+        }
+
+        function removeShotById(id) {
+          const shot = shots.get(id);
+          if (!shot) return;
+          disposeShot(shot);
+          shots.delete(id);
+
+          if (selectedShotId === id) {
+            const remaining = [...shots.keys()].sort((a, b) => b - a);
+            selectedShotId = remaining.length ? remaining[0] : 0;
+          }
+          renderInventory();
+        }
+
+        function clearAllShots() {
+          for (const shot of shots.values()) {
+            disposeShot(shot);
+          }
+          shots.clear();
+          selectedShotId = 0;
+          renderInventory();
+        }
 
         function renderInventory() {
           list.innerHTML = '';
           const ids = [...shots.keys()].sort((a, b) => b - a);
+          const frag = document.createDocumentFragment();
+
           for (const id of ids) {
             const shot = shots.get(id);
             const btn = document.createElement('button');
@@ -151,7 +236,7 @@
             btn.type = 'button';
 
             const img = document.createElement('img');
-            img.src = shot.dataUrl;
+            img.src = shot.objectUrl;
             img.alt = `shot-${id}`;
             btn.appendChild(img);
 
@@ -165,32 +250,53 @@
               renderInventory();
             });
 
-            list.appendChild(btn);
+            frag.appendChild(btn);
           }
+
+          list.appendChild(frag);
+          updateStatus();
         }
 
-        window.__framespaceAddSnapshot = (shotId, dataUrl) => {
-          shots.set(shotId, { dataUrl });
-          if (!selectedShotId) selectedShotId = shotId;
+        window.__framespaceAddSnapshotFromCanvas = async (shotId) => {
+          const canvas = document.querySelector('#canvas');
+          if (!canvas) return;
+          const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+          if (!blob) return;
+
+          const prev = shots.get(shotId);
+          disposeShot(prev);
+          shots.set(shotId, { objectUrl: URL.createObjectURL(blob) });
+          selectedShotId = shotId;
+
+          while (shots.size > MAX_SHOTS) {
+            const oldestId = Math.min(...shots.keys());
+            removeShotById(oldestId);
+          }
+
           renderInventory();
         };
 
         window.__framespaceGetSelectedShotId = () => selectedShotId || 0;
+        window.__framespaceHasShotId = (shotId) => shots.has(shotId);
 
-        window.addEventListener('keydown', (ev) => {
-          if (ev.repeat) return;
-          if (!window.Module || typeof window.Module.ccall !== 'function') return;
+        document.getElementById('btn-capture').addEventListener('click', () => {
+          invokeNative('framespace_trigger_capture');
+        });
 
-          if (ev.code === 'KeyP') {
-            console.log('[Input] JS fallback KeyP');
-            window.Module.ccall('framespace_trigger_capture', null, [], []);
-          }
+        document.getElementById('btn-place').addEventListener('click', () => {
+          invokeNative('framespace_trigger_place');
+        });
 
-          if (ev.code === 'KeyE') {
-            console.log('[Input] JS fallback KeyE');
-            window.Module.ccall('framespace_trigger_place', null, [], []);
-          }
-        }, true);
+        document.getElementById('btn-remove').addEventListener('click', () => {
+          if (!selectedShotId) return;
+          removeShotById(selectedShotId);
+        });
+
+        document.getElementById('btn-clear').addEventListener('click', () => {
+          clearAllShots();
+        });
+
+        updateStatus();
       })();
     </script>
     {{{ SCRIPT }}}
